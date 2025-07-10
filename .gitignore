@@ -106,3 +106,4 @@ temp/
 data.*
 yarn.*
 package-lock.*
+.env
