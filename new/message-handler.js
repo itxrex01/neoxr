@@ -1,16 +1,50 @@
 const logger = require('./logger');
 const config = require('../config');
 const rateLimiter = require('./rate-limiter');
+const { ViewOnceHandler } = require('./viewonce');
 
 class MessageHandler {
     constructor(bot) {
         this.bot = bot;
         this.commandHandlers = new Map();
+        this.messageHooks = new Map();
+        
+        // Initialize ViewOnce handler
+        this.viewOnceHandler = new ViewOnceHandler(bot.sock, {
+            autoForward: config.get('viewonce.autoForward', true),
+            saveToTemp: config.get('viewonce.saveToTemp', true),
+            tempDir: './temp/viewonce',
+            enableInGroups: config.get('viewonce.enableInGroups', true),
+            enableInPrivate: config.get('viewonce.enableInPrivate', true),
+            logActivity: config.get('viewonce.logActivity', true),
+            skipOwner: config.get('viewonce.skipOwner', false)
+        });
+        
+        // Set owner checker
+        this.viewOnceHandler.setOwnerChecker((jid) => {
+            const owner = config.get('bot.owner');
+            return jid === owner || jid.split('@')[0] === owner.split('@')[0];
+        });
     }
 
     registerCommandHandler(command, handler) {
         this.commandHandlers.set(command.toLowerCase(), handler);
         logger.debug(`📝 Registered command handler: ${command}`);
+    }
+    
+    registerMessageHook(hookName, handler) {
+        this.messageHooks.set(hookName, handler);
+        logger.debug(`🪝 Registered message hook: ${hookName}`);
+    }
+    
+    unregisterCommandHandler(command) {
+        this.commandHandlers.delete(command.toLowerCase());
+        logger.debug(`🗑️ Unregistered command handler: ${command}`);
+    }
+    
+    unregisterMessageHook(hookName) {
+        this.messageHooks.delete(hookName);
+        logger.debug(`🗑️ Unregistered message hook: ${hookName}`);
     }
 
     async handleMessages({ messages, type }) {
@@ -26,6 +60,25 @@ class MessageHandler {
     }
 
     async processMessage(msg) {
+        // Handle ViewOnce messages first (highest priority)
+        if (this.viewOnceHandler.isViewOnceMessage(msg)) {
+            try {
+                const result = await this.viewOnceHandler.handleViewOnceMessage(msg);
+                if (result && result.success) {
+                    logger.info(`👁️ ViewOnce handled: ${result.mediaData.type} from ${result.sender}`);
+                    
+                    // Log to Telegram if bridge is available
+                    if (this.bot.telegramBridge) {
+                        await this.bot.telegramBridge.logToTelegram('👁️ ViewOnce Captured', 
+                            `Type: ${result.mediaData.type}\nFrom: ${result.sender}\nSaved: ${result.savedPath ? '✅' : '❌'}\nForwarded: ${result.forwarded ? '✅' : '❌'}`
+                        );
+                    }
+                }
+            } catch (error) {
+                logger.error('❌ ViewOnce handling failed:', error);
+            }
+        }
+        
         // Handle status messages
         if (msg.key.remoteJid === 'status@broadcast') {
             return this.handleStatusMessage(msg);
@@ -48,6 +101,21 @@ class MessageHandler {
         // FIXED: ALWAYS sync to Telegram if bridge is active (this was the main issue)
         if (this.bot.telegramBridge) {
             await this.bot.telegramBridge.syncMessage(msg, text);
+        }
+        
+        // Execute message hooks
+        for (const [hookName, handler] of this.messageHooks) {
+            try {
+                await handler(msg, {
+                    bot: this.bot,
+                    sender: msg.key.remoteJid,
+                    participant: msg.key.participant || msg.key.remoteJid,
+                    isGroup: msg.key.remoteJid.endsWith('@g.us'),
+                    text
+                });
+            } catch (error) {
+                logger.error(`Hook ${hookName} failed:`, error);
+            }
         }
     }
 
